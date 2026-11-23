@@ -1,4 +1,10 @@
-import { useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+} from "react";
 import { ApiClientError, api } from "../api/client";
 import type { UploadResponse } from "../types";
 
@@ -12,6 +18,7 @@ type PendingFile = {
 };
 
 const MAX_FILES = 5;
+const VARIANT_WIDTHS = [480, 1024, 1600];
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -19,9 +26,175 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function expectedVariantWidths(width: number): number[] {
+  const widths = VARIANT_WIDTHS.filter((item) => item < width);
+  if (widths.length === 0) return [width];
+  if (widths.length < 3 && width > widths[widths.length - 1]) widths.push(width);
+  return [...new Set(widths)].sort((a, b) => a - b).slice(0, 3);
+}
+
+function PendingThumb({
+  file,
+  alt,
+  onOpen,
+}: {
+  file: File;
+  alt: string;
+  onOpen: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+    setFailed(false);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+
+  return (
+    <button className="pending-thumb-button" type="button" onClick={onOpen}>
+      {url && !failed ? (
+        <img
+          src={url}
+          alt={alt || file.name}
+          onError={() => setFailed(true)}
+          loading="eager"
+          decoding="async"
+        />
+      ) : (
+        <span className="pending-thumb-placeholder">
+          {failed ? "Không xem trước được" : "Đang tạo preview…"}
+        </span>
+      )}
+      <span className="pending-preview-hint">Xem trước</span>
+    </button>
+  );
+}
+
+function LocalPreview({
+  file,
+  alt,
+  onClose,
+}: {
+  file: File;
+  alt: string;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(
+    null,
+  );
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+    setDimensions(null);
+    setFailed(false);
+
+    const image = new Image();
+    image.onload = () => {
+      setDimensions({ width: image.naturalWidth, height: image.naturalHeight });
+    };
+    image.onerror = () => setFailed(true);
+    image.src = objectUrl;
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+      image.onload = null;
+      image.onerror = null;
+    };
+  }, [file]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = previous;
+    };
+  }, [onClose]);
+
+  const variants = dimensions
+    ? expectedVariantWidths(dimensions.width)
+    : [];
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="local-preview-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Xem trước ${file.name}`}
+      >
+        <button className="modal-close" onClick={onClose} aria-label="Đóng">
+          ×
+        </button>
+
+        <div className="local-preview-media">
+          {url && !failed ? (
+            <img src={url} alt={alt || file.name} />
+          ) : (
+            <span className="local-preview-failed">
+              {failed ? "Không thể đọc file này như ảnh" : "Đang tạo preview…"}
+            </span>
+          )}
+        </div>
+
+        <aside className="local-preview-info">
+          <p className="eyebrow">Preview cục bộ · chưa tải lên</p>
+          <h2>{file.name}</h2>
+          <dl className="meta-list">
+            <div>
+              <dt>Dung lượng</dt>
+              <dd>{formatBytes(file.size)}</dd>
+            </div>
+            <div>
+              <dt>Kích thước</dt>
+              <dd>
+                {dimensions
+                  ? `${dimensions.width} × ${dimensions.height}`
+                  : "Đang đọc…"}
+              </dd>
+            </div>
+            <div>
+              <dt>Variant dự kiến</dt>
+              <dd>{variants.length ? variants.map((w) => `${w}w`).join(" · ") : "—"}</dd>
+            </div>
+            <div>
+              <dt>Alt text</dt>
+              <dd>{alt || "Sẽ dùng tên file"}</dd>
+            </div>
+          </dl>
+          <p className="local-preview-note">
+            Đây chỉ là preview trên trình duyệt. Khi bấm tải lên, server mới kiểm tra
+            nội dung thật bằng magic bytes + decode, chuẩn hóa ảnh và tạo variant.
+          </p>
+          <div className="local-preview-actions">
+            <button className="btn btn-primary" onClick={onClose}>
+              Đóng preview
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
 export function UploadPanel({ onUploaded }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [pending, setPending] = useState<PendingFile[]>([]);
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -61,10 +234,12 @@ export function UploadPanel({ onUploaded }: Props) {
 
   const removeFile = (index: number) => {
     setPending((current) => current.filter((_, itemIndex) => itemIndex !== index));
+    setPreviewIndex(null);
   };
 
   const submit = async () => {
     if (pending.length === 0) return;
+    setPreviewIndex(null);
     setUploading(true);
     setError("");
     setResult(null);
@@ -76,7 +251,9 @@ export function UploadPanel({ onUploaded }: Props) {
       setResult(response);
       if (response.summary.succeeded > 0) {
         onUploaded();
-        setPending((current) => current.filter((_, index) => !response.results[index]?.ok));
+        setPending((current) =>
+          current.filter((_, index) => !response.results[index]?.ok),
+        );
       }
     } catch (caught) {
       setError(
@@ -88,6 +265,9 @@ export function UploadPanel({ onUploaded }: Props) {
       setUploading(false);
     }
   };
+
+  const previewItem =
+    previewIndex !== null && previewIndex < pending.length ? pending[previewIndex] : null;
 
   return (
     <section className="upload-panel">
@@ -116,7 +296,10 @@ export function UploadPanel({ onUploaded }: Props) {
       >
         <strong>Kéo ảnh vào đây</strong>
         <span>hoặc bấm để chọn từ máy</span>
-        <small>Ảnh được kiểm tra nội dung thật, chuẩn hóa và tạo tối đa 3 kích thước.</small>
+        <small>
+          Ảnh được xem trước ngay trên trình duyệt trước khi tải lên. Server kiểm tra
+          nội dung thật, chuẩn hóa và tạo tối đa 3 kích thước.
+        </small>
         <input
           ref={inputRef}
           type="file"
@@ -128,28 +311,35 @@ export function UploadPanel({ onUploaded }: Props) {
       </div>
 
       {pending.length > 0 ? (
-        <div className="pending-list">
+        <div className="pending-grid">
           {pending.map((item, index) => (
-            <div className="pending-row" key={`${item.file.name}-${index}`}>
-              <div className="pending-meta">
-                <strong>{item.file.name}</strong>
-                <span>{formatBytes(item.file.size)}</span>
-              </div>
-              <input
-                value={item.alt}
-                onChange={(event) => updateAlt(index, event.target.value)}
-                placeholder="Alt text (mô tả ảnh)"
-                maxLength={300}
+            <article className="pending-card" key={`${item.file.name}-${item.file.lastModified}-${index}`}>
+              <PendingThumb
+                file={item.file}
+                alt={item.alt}
+                onOpen={() => setPreviewIndex(index)}
               />
               <button
-                className="icon-btn"
+                className="pending-remove icon-btn"
                 onClick={() => removeFile(index)}
                 aria-label={`Bỏ ${item.file.name}`}
                 type="button"
               >
                 ×
               </button>
-            </div>
+              <div className="pending-card-body">
+                <div className="pending-meta">
+                  <strong title={item.file.name}>{item.file.name}</strong>
+                  <span>{formatBytes(item.file.size)}</span>
+                </div>
+                <input
+                  value={item.alt}
+                  onChange={(event) => updateAlt(index, event.target.value)}
+                  placeholder="Mô tả ảnh (alt text)"
+                  maxLength={300}
+                />
+              </div>
+            </article>
           ))}
         </div>
       ) : null}
@@ -172,6 +362,11 @@ export function UploadPanel({ onUploaded }: Props) {
       ) : null}
 
       <div className="upload-actions">
+        <span className="upload-hint">
+          {pending.length > 0
+            ? `${pending.length} ảnh đã chọn · bấm ảnh để xem trước`
+            : "Chưa chọn ảnh nào"}
+        </span>
         <button
           className="btn btn-primary"
           onClick={submit}
@@ -180,6 +375,14 @@ export function UploadPanel({ onUploaded }: Props) {
           {uploading ? "Đang xử lý ảnh…" : `Tải ${pending.length || ""} ảnh lên`}
         </button>
       </div>
+
+      {previewItem ? (
+        <LocalPreview
+          file={previewItem.file}
+          alt={previewItem.alt}
+          onClose={() => setPreviewIndex(null)}
+        />
+      ) : null}
     </section>
   );
 }
