@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: photo-gallery-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gallery}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gallery}
+      POSTGRES_DB: ${POSTGRES_DB:-photo_gallery}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gallery} -d ${POSTGRES_DB:-photo_gallery}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  seaweedfs:
+    # Local development image. Pin a specific tag/digest for production.
+    image: chrislusf/seaweedfs:latest
+    container_name: photo-gallery-seaweedfs
+    restart: unless-stopped
+    command: >
+      server -s3 -dir=/data -ip.bind=0.0.0.0
+      -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "8333:8333"
+      - "9333:9333"
+      - "8888:8888"
+    volumes:
+      - seaweed_data:/data
+      - ./infra/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+
+volumes:
+  pg_data:
+  seaweed_data:

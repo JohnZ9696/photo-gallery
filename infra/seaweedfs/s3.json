@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "gallery",
+      "credentials": [
+        {
+          "accessKey": "gallery",
+          "secretKey": "gallery-local-secret"
+        }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    }
+  ]
+}

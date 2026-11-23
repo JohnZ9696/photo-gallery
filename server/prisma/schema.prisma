@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PhotoStatus {
+  READY
+  DELETED
+  PURGED
+}
+
+enum VersionStatus {
+  STAGED
+  PUBLISHED
+  SUPERSEDED
+  FAILED
+  PURGED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  displayName  String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  photos   Photo[]
+  sessions Session[]
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  userId     String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Counter {
+  name  String @id
+  value Int    @default(0)
+}
+
+model Photo {
+  id             String      @id
+  ownerId        String
+  alt            String
+  originalName   String
+  masterKey      String?
+  masterWidth    Int
+  masterHeight   Int
+  masterBytes    Int
+  masterChecksum String
+  format         String
+  currentVersion Int         @default(1)
+  nextVersion    Int         @default(2)
+  status         PhotoStatus @default(READY)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  deletedAt      DateTime?
+  purgedAt       DateTime?
+
+  owner    User           @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  versions PhotoVersion[]
+  variants PhotoVariant[]
+
+  @@index([status, createdAt])
+  @@index([ownerId, createdAt])
+}
+
+model PhotoVersion {
+  id           String        @id @default(cuid())
+  photoId      String
+  version      Int
+  paramsJson   String
+  status       VersionStatus @default(STAGED)
+  createdAt    DateTime      @default(now())
+  publishedAt  DateTime?
+  supersededAt DateTime?
+
+  photo Photo @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  @@unique([photoId, version])
+  @@index([status, createdAt])
+  @@index([status, supersededAt])
+}
+
+model PhotoVariant {
+  id          String    @id @default(cuid())
+  photoId     String
+  version     Int
+  kind        String
+  storageKey  String    @unique
+  contentType String
+  width       Int
+  height      Int
+  bytes       Int
+  checksum    String
+  createdAt   DateTime  @default(now())
+  cleanedAt   DateTime?
+
+  photo Photo @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  @@unique([photoId, version, kind])
+  @@index([photoId, version])
+}
+
+model CleanupJob {
+  id         String   @id @default(cuid())
+  type       String
+  photoId    String?
+  version    Int?
+  storageKey String?
+  prefix     String?
+  runAfter   DateTime
+  attempts   Int      @default(0)
+  lastError  String?
+  status     String   @default("PENDING")
+  createdAt  DateTime @default(now())
+
+  @@index([status, runAfter])
+}
