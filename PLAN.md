@@ -1,11 +1,15 @@
-# Kế hoạch triển khai Photo Gallery (React + Node.js)
+# Kế hoạch triển khai Photo Gallery (React + Node.js + PostgreSQL)
 
 ## 1. Mục tiêu & phạm vi
 
-Xây dựng một photo gallery có upload nhiều ảnh, tự sinh variant responsive, lưu trữ trên MinIO/SeaweedFS, có metadata trong DB và bộ công cụ chỉnh sửa ảnh (crop, xoay, lật ngang, khôi phục) theo mô hình **version + publish an toàn**.
+Xây dựng một photo gallery có đăng ký/đăng nhập, upload nhiều ảnh, tự sinh variant responsive, lưu trữ trên **SeaweedFS S3 gateway**, có metadata trong PostgreSQL và bộ công cụ chỉnh sửa ảnh (crop, xoay, lật ngang, khôi phục) theo mô hình **version + publish an toàn**.
+
+Người dùng đã đăng nhập có thể xem ảnh của **tất cả người dùng khác**; chỉ chủ sở hữu ảnh mới được chỉnh sửa, khôi phục hoặc xóa ảnh đó.
 
 ### Trong phạm vi
 
+- Đăng ký, đăng nhập, đăng xuất bằng email + mật khẩu; session cookie bảo mật.
+- Phân quyền: mọi user đã đăng nhập xem được gallery chung; chỉ owner được sửa/xóa ảnh.
 - Upload 1–5 ảnh trong một request; trả kết quả riêng cho từng file.
 - Kiểm tra ảnh thật bằng magic bytes + decode, không tin phần mở rộng/MIME do client gửi.
 - Chuẩn hóa ảnh gốc (auto-orient, sRGB, strip metadata) và sinh tối đa 3 variant WebP.
@@ -20,7 +24,8 @@ Xây dựng một photo gallery có upload nhiều ảnh, tự sinh variant resp
 
 ### Ngoài phạm vi (ghi nhận để tránh phình scope)
 
-- Đăng nhập, phân quyền đa người dùng, multi-tenant.
+- OAuth/social login, xác thực email, quên mật khẩu qua email.
+- Vai trò admin/moderator, gallery riêng tư theo từng ảnh.
 - CDN, image resizing on-the-fly, video.
 - AI tagging, tìm kiếm nâng cao.
 - Đồng bộ đa thiết bị realtime.
@@ -37,8 +42,10 @@ Xây dựng một photo gallery có upload nhiều ảnh, tự sinh variant resp
 | Backend | Node.js 22 + Express 5 + TypeScript | Quen thuộc, dễ kiểm soát stream upload |
 | Validation | Zod (strict object) | Chặn field lạ, ép kiểu, giới hạn giá trị |
 | Xử lý ảnh | `sharp` | Decode/normalize/resize/rotate/flip, strip EXIF |
-| Storage | S3 API qua `@aws-sdk/client-s3` | Dùng chung MinIO và SeaweedFS S3 gateway |
-| DB | SQLite + Prisma (dev), có thể đổi Postgres | Chạy ngay, không cần service phụ; restart vẫn còn dữ liệu |
+| Storage | SeaweedFS S3 gateway qua `@aws-sdk/client-s3` | Đúng yêu cầu; single-node local, S3-compatible, không dùng MinIO |
+| DB | PostgreSQL 16 local (Docker) + Prisma | Quan hệ user/photo chặt chẽ, transaction & concurrent edit an toàn |
+| Auth | Session cookie httpOnly + `argon2id` | Không lưu token trong localStorage; chống XSS đánh cắp session |
+| Password/session | `argon2` (hash mật khẩu), SHA-256 (hash session token trong DB) | Mật khẩu không lưu plaintext; DB lộ không dùng lại được cookie |
 | Multipart | Busboy | Kiểm soát giới hạn theo từng file, không hủy cả request |
 | Logging | Pino + requestId | Truy vết lỗi theo từng file |
 | Test | Vitest + Supertest + Playwright | Unit, API integration, E2E |
@@ -46,12 +53,13 @@ Xây dựng một photo gallery có upload nhiều ảnh, tự sinh variant resp
 
 ### Nguyên tắc kiến trúc
 
-1. **DB là nguồn sự thật** cho trạng thái gallery và key file. Storage chỉ chứa object.
+1. **DB là nguồn sự thật** cho trạng thái gallery, quyền sở hữu và key file. Storage chỉ chứa object.
 2. **Không BAO GIỜ chỉnh sửa từ variant.** Mọi edit/restore đọc `Photo.masterKey` (bản gốc đã chuẩn hóa).
 3. **Version bất biến:** mỗi version có URL riêng; không ghi đè file cũ.
 4. **Publish hai pha:** ghi đủ file + metadata trước, chỉ cập nhật `currentVersion` sau cùng.
 5. **Fail-safe:** lỗi DB sau khi ghi file thì xóa file; nếu xóa lỗi thì ghi journal để sweeper dọn lại.
 6. **Không lưu đường dẫn tuyệt đối:** mọi thứ trong DB là storage key tương đối.
+7. **Mọi route ảnh đều qua auth middleware.** Gallery chung cho user đã đăng nhập; mutation kiểm tra `ownerId`.
 
 ---
 
@@ -62,7 +70,10 @@ photo-gallery/
 ├── PLAN.md
 ├── README.md                       # setup, retention table, acceptance checklist
 ├── package.json                    # npm workspaces + script tổng
-├── docker-compose.yml              # minio (default), seaweedfs (profile)
+├── docker-compose.yml              # postgres + seaweedfs (S3 gateway)
+├── infra/
+│   └── seaweedfs/
+│       └── s3.json                 # credentials + quyền cho S3 gateway
 ├── .env.example
 ├── server/
 │   ├── package.json
@@ -77,6 +88,11 @@ photo-gallery/
 │       │   └── retention.ts        # cùng nguồn với bảng trong README
 │       ├── db/
 │       │   └── prisma.ts
+│       ├── auth/
+│       │   ├── password.ts         # argon2 hash/verify
+│       │   ├── session.ts          # tạo/thu hồi session, cookie
+│       │   ├── middleware.ts       # requireAuth, requireOwner
+│       │   └── routes.ts           # register/login/logout/me
 │       ├── storage/
 │       │   ├── adapter.ts          # interface StorageAdapter
 │       │   └── s3.ts               # put/get/head/deleteMany/listPrefix
@@ -92,6 +108,7 @@ photo-gallery/
 │       │   ├── cleanup.ts          # job runner, orphan scan, journal
 │       │   └── photos.ts           # DTO, list, delete
 │       ├── routes/
+│       │   ├── auth.ts
 │       │   ├── photos.ts
 │       │   └── media.ts
 │       ├── lib/
@@ -110,7 +127,15 @@ photo-gallery/
 │       ├── main.tsx
 │       ├── App.tsx
 │       ├── api/client.ts
+│       ├── auth/
+│       │   ├── AuthContext.tsx      # user hiện tại, login/logout
+│       │   └── ProtectedRoute.tsx
+│       ├── pages/
+│       │   ├── LoginPage.tsx
+│       │   ├── RegisterPage.tsx
+│       │   └── GalleryPage.tsx
 │       ├── components/
+│       │   ├── Header.tsx           # user menu, đăng xuất
 │       │   ├── UploadPanel.tsx
 │       │   ├── Gallery.tsx
 │       │   ├── PhotoCard.tsx
@@ -120,7 +145,7 @@ photo-gallery/
 │       └── styles/
 ├── scripts/
 │   └── cleanup.ts                  # CLI dọn tay: photo, orphan, retention
-└── .data/                          # SQLite + upload temp + cleanup journal (gitignored)
+└── .data/                          # upload temp + cleanup journal (gitignored; DB nằm trong volume PostgreSQL)
 ```
 
 ---
@@ -130,6 +155,9 @@ photo-gallery/
 ### 4.1 Prisma schema (rút gọn)
 
 ```prisma
+// provider = "postgresql"
+// DATABASE_URL=postgresql://gallery:gallery@localhost:5432/photo_gallery?schema=public
+
 enum PhotoStatus {
   READY
   DELETED      // đã ẩn khỏi gallery, đang chờ dọn
@@ -144,8 +172,35 @@ enum VersionStatus {
   PURGED       // file đã xóa
 }
 
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique              // luôn lưu lowercase đã normalize
+  displayName  String
+  passwordHash String                         // argon2id, không bao giờ trả ra API
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  photos   Photo[]
+  sessions Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique                  // SHA-256(token), không lưu token gốc
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
 model Photo {
-  id             String      @id            // "p01", "p02", ...
+  id             String      @id            // "p01", "p02", ... (unique toàn hệ thống)
+  ownerId        String
   alt            String
   originalName   String
   masterKey      String?                    // photos/p01/master.webp, null sau purge
@@ -162,8 +217,12 @@ model Photo {
   deletedAt      DateTime?
   purgedAt       DateTime?
 
+  owner    User           @relation(fields: [ownerId], references: [id], onDelete: Restrict)
   versions PhotoVersion[]
   variants PhotoVariant[]
+
+  @@index([status, createdAt])
+  @@index([ownerId, createdAt])
 }
 
 model PhotoVersion {
@@ -222,6 +281,9 @@ model CleanupJob {
 - `masterKey` không bao giờ nằm trong `photos/{id}/v{n}/` (tránh bị dọn nhầm khi xóa version).
 - Mọi ảnh hiển thị trong gallery phải có `alt` khác rỗng (mặc định sinh từ tên file).
 - `storageKey` là relative key, ví dụ `photos/p01/v2/medium-1024w.webp`; API tự build URL.
+- Mỗi `Photo` có đúng một `ownerId`; `ownerId` bất biến sau khi tạo.
+- Email unique sau khi lowercase/trim; mật khẩu chỉ tồn tại dưới dạng hash argon2id.
+- Session hết hạn bị từ chối; logout xóa bản ghi session tương ứng.
 
 ---
 
@@ -248,12 +310,60 @@ photos/
 - Variant luôn là WebP, chất lượng server quy định (khoảng 80), strip toàn bộ metadata.
 - Master là WebP chất lượng cao (khoảng 95), đã auto-orient + sRGB + strip metadata.
 - Version 1 được tạo khi upload. Edit/restore luôn tạo version `currentVersion + 1` (cấp phát qua `nextVersion`).
+- Photo ID unique toàn hệ thống; quyền sở hữu nằm ở `Photo.ownerId`, không mã hóa vào storage key. Nhờ vậy key ngắn, ổn định và không lộ thông tin user.
+- Xóa ảnh xóa toàn bộ prefix `photos/{photoId}/`, không ảnh hưởng ảnh của user khác.
 
 ---
 
 ## 6. API contract
 
-### 6.1 Upload
+Tất cả route dưới `/api/photos` và `/media` đều yêu cầu session hợp lệ. `register`, `login`, `GET /api/auth/me` là public (`me` trả `null` nếu chưa đăng nhập); `logout` yêu cầu session.
+
+Session được gửi bằng cookie `sid` (`httpOnly`, `SameSite=Lax`, `Secure` ở production). Không nhận `userId` từ client; owner luôn lấy từ session. Các mutation kiểm tra thêm `Origin`/`Referer` cùng origin để chống CSRF.
+
+### 6.1 Auth
+
+```http
+POST /api/auth/register
+Content-Type: application/json
+
+{ "email": "an@example.com", "displayName": "An", "password": "matkhau-du-manh" }
+```
+
+- Email: trim + lowercase, đúng định dạng, unique → lỗi `409 EMAIL_TAKEN`.
+- `displayName`: 2–50 ký tự.
+- Password: 8–128 ký tự; hash bằng argon2id, không giới hạn/trim mật khẩu.
+- Thành công: `201` + user DTO + set cookie session.
+- Rate limit theo IP (ví dụ 10 request/phút).
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+
+{ "email": "an@example.com", "password": "..." }
+```
+
+- Sai email hoặc mật khẩu: cùng một lỗi `401 AUTH_INVALID`, không tiết lộ email có tồn tại.
+- Thành công: tạo session mới, set cookie, trả user DTO.
+- Rate limit chặt hơn (ví dụ 10 lần/phút/IP).
+
+```http
+POST /api/auth/logout   → 204, xóa session hiện tại + clear cookie
+GET  /api/auth/me       → 200 { user: UserDTO | null }
+```
+
+`UserDTO = { id, email, displayName, createdAt }` — tuyệt đối không trả `passwordHash`/session token.
+
+Quy tắc session:
+
+- Token ngẫu nhiên 32 byte, chỉ lưu SHA-256 trong `Session.tokenHash`.
+- TTL 7 ngày (env `SESSION_TTL_DAYS`), `lastSeenAt` cập nhật tối đa 1 lần/giờ.
+- Logout xóa session hiện tại; đổi mật khẩu (nếu bổ sung sau này) thu hồi mọi session.
+- Session hết hạn bị từ chối và dọn định kỳ.
+- Dev: Vite proxy `/api` và `/media` sang backend `localhost:3000` để cookie same-origin; production phục vụ web + API cùng origin (reverse proxy).
+- `fetch` phía web dùng `credentials: "include"` để gửi/nhận cookie session.
+
+### 6.2 Upload
 
 ```http
 POST /api/photos
@@ -293,12 +403,17 @@ Mã lỗi từng file: `TOO_LARGE_BYTES`, `TOO_LARGE_PIXELS`, `INVALID_IMAGE`, `
 - Vượt quá 5 file ở cấp request: `400 TOO_MANY_FILES`, không xử lý file nào.
 - File bị từ chối: **không** tạo DB record, **không** để lại file.
 - JPEG/PNG/WebP hợp lệ đều được nhận; kiểm tra dựa trên nội dung thực.
+- `Photo.ownerId` lấy từ session, client không được gửi owner.
 
-### 6.2 Gallery
+### 6.3 Gallery
 
 ```http
-GET /api/photos?cursor=...&limit=24
+GET /api/photos?cursor=...&limit=24&scope=all   # scope=all | mine
 ```
+
+- Mặc định `scope=all`: user đã đăng nhập thấy ảnh của **mọi user** (chỉ ảnh `READY`).
+- `scope=mine`: chỉ ảnh do user hiện tại upload.
+- Không trả ảnh `DELETED`/`PURGED`; không trả ảnh của user bị vô hiệu hóa (nếu bổ sung sau).
 
 ```json
 {
@@ -309,6 +424,8 @@ GET /api/photos?cursor=...&limit=24
       "width": 4032,
       "height": 3024,
       "currentVersion": 2,
+      "owner": { "id": "u01", "displayName": "An" },
+      "canEdit": true,
       "variants": [
         {
           "kind": "thumb",
@@ -340,8 +457,9 @@ GET /api/photos?cursor=...&limit=24
 - `width`/`height` trong item là kích thước master (dùng cho editor/crop).
 - Client tự dựng `srcSet` từ `variants`; `src` mặc định là `medium` (không phải large).
 - Gallery chỉ trả variant của `currentVersion` đang `PUBLISHED`.
+- `canEdit` = `photo.ownerId === session.userId`; UI ẩn nút sửa/xóa của người khác.
 
-### 6.3 Chỉnh sửa & khôi phục
+### 6.4 Chỉnh sửa & khôi phục
 
 ```http
 POST /api/photos/:id/edits
@@ -362,6 +480,8 @@ Content-Type: application/json
 - `expectedVersion`: bắt buộc, chống ghi đè khi có edit đồng thời.
 - Zod `.strict()`: từ chối field lạ, số thực cho tọa độ, giá trị ngoài biên.
 - Thứ tự áp dụng cố định: **crop → rotate → flipH** (client preview phải dùng đúng thứ tự này).
+- Chỉ owner được gọi; user khác nhận `403 FORBIDDEN`. Ảnh của người khác vẫn xem được.
+- Photo không tồn tại/đã xóa: `404 PHOTO_NOT_FOUND`.
 
 ```http
 POST /api/photos/:id/restore
@@ -372,37 +492,42 @@ Content-Type: application/json
 
 - Luôn tạo version mới từ `masterKey`, params identity `{crop:null, rotate:0, flipH:false}`.
 - Nếu đang có edit dở hoặc version conflict: `409 VERSION_CONFLICT` kèm `currentVersion`.
+- Chỉ owner được gọi; user khác nhận `403 FORBIDDEN`.
 
 Response edit/restore: `201` + PhotoDTO mới (currentVersion mới, variants mới).
 
-### 6.4 Xóa ảnh
+### 6.5 Xóa ảnh
 
 ```http
 DELETE /api/photos/:id
 ```
 
+- Chỉ owner được xóa; user khác nhận `403 FORBIDDEN`.
 - Ẩn ngay khỏi gallery (`status = DELETED`, `deletedAt`).
 - Thử dọn ngay: xóa prefix `photos/{id}/` trên storage, rồi hard-delete DB.
 - Nếu storage lỗi: giữ record `DELETED`, tạo `CleanupJob`, trả `202`; worker retry.
 - Media của photo đã xóa trả `404` ngay cả khi file chưa kịp xóa.
 
-### 6.5 Media
+### 6.6 Media
 
 ```http
 GET /media/:photoId/v/:version/:kind    # kind = thumb | medium | large
 ```
 
 - Tra DB theo `(photoId, version, kind)` → stream object từ S3. Không nhận key tùy ý từ client.
+- Yêu cầu session hợp lệ (cookie gửi kèm request `<img>`); user đã đăng nhập được xem ảnh của mọi user.
 - Nếu photo `DELETED`/`PURGED`, version không tồn tại/chưa publish: `404`.
 - Headers:
   - `Content-Type: image/webp` (lấy từ DB)
-  - `Cache-Control: public, max-age=31536000, immutable`
+  - `Cache-Control: private, max-age=31536000, immutable` (vì ảnh cần đăng nhập; tránh cache chung rò rỉ ảnh)
+  - `Vary: Cookie`
   - `ETag` = checksum; `Content-Length`; `X-Content-Type-Options: nosniff`
   - `Content-Disposition: inline`
 - JSON API dùng `Cache-Control: no-store`.
-- Set metadata `Cache-Control`/`Content-Type` tương tự khi `PutObject`.
+- Set metadata `Cache-Control: private, max-age=31536000, immutable`/`Content-Type` tương tự khi `PutObject`.
+- Nếu sau này cần ảnh public thật sự, chuyển sang `public` + URL có chữ ký/không đoán được; không đổi ngầm.
 
-### 6.6 Health
+### 6.7 Health
 
 ```http
 GET /api/health
@@ -426,10 +551,12 @@ Request multipart
           6. Normalize: .rotate() auto-orient, to sRGB, strip metadata, WebP q95 → master
           7. Sinh kế hoạch variant: 480/1024/1600, bỏ width > master width, dedupe
           8. Render + upload master & variant lên storage
-          9. Transaction DB: tạo Photo + PhotoVersion(v1, PUBLISHED) + PhotoVariant
+          9. Transaction DB: tạo Photo(ownerId=session.userId) + PhotoVersion(v1, PUBLISHED) + PhotoVariant
          10. Nếu DB lỗi: xóa các object vừa ghi; nếu xóa lỗi → cleanup journal + CleanupJob
          11. Xóa temp file trong finally
 ```
+
+Route upload yêu cầu session; nếu chưa đăng nhập trả `401` trước khi đọc file. Owner được gán từ session, không từ form field.
 
 ### 7.1 Kiểm tra ảnh thật
 
@@ -455,9 +582,10 @@ Byte limit phải được xử lý **theo từng part** để không hủy kế
 
 ### 7.3 Id & transaction
 
-- Sinh `p01`, `p02` bằng bảng đếm/`AUTOINCREMENT` trong transaction; không dùng timestamp làm ID.
+- Photo ID dạng `p01`, `p02`… sinh từ PostgreSQL sequence (`photo_id_seq`), format `p` + zero-pad; không dùng timestamp.
 - Upload 5 ảnh: mỗi file là một transaction độc lập, tránh 1 file lỗi làm rollback cả batch.
 - Storage key được tạo hoàn toàn từ server; không nhận path từ client.
+- Owner gán từ session trong cùng transaction insert Photo; không có ảnh "không chủ".
 
 ---
 
@@ -481,6 +609,7 @@ const EditParams = z.object({
 
 Kiểm tra thêm trên server:
 
+- Load Photo theo `id`, kiểm tra `ownerId === session.userId`; khác owner → `403`.
 - `x + width <= masterWidth`, `y + height <= masterHeight`.
 - Crop không được vượt biên, không âm, không rỗng.
 - Sau crop + rotate, tổng pixel ≤ `MAX_PIXELS`.
@@ -490,7 +619,7 @@ Kiểm tra thêm trên server:
 ### 8.2 Luồng tạo version
 
 ```text
-1. Load Photo (status READY), masterKey
+1. requireAuth → Load Photo (status READY), kiểm tra owner, masterKey
 2. Transaction ngắn: cấp version = photo.nextVersion; nextVersion += 1;
    tạo PhotoVersion(status=STAGED, paramsJson)
 3. Đọc master từ storage (KHÔNG đọc variant)
@@ -511,7 +640,7 @@ Kiểm tra thêm trên server:
      - version → FAILED hoặc giữ STAGED
      - enqueue cleanup prefix photos/{id}/v{n}/
      - trả 409/500, không thay đổi currentVersion
-10. Trả PhotoDTO mới
+10. Trả PhotoDTO mới (kèm owner + canEdit)
 ```
 
 ### 8.3 Điểm quan trọng
@@ -523,19 +652,21 @@ Kiểm tra thêm trên server:
 - Old version vẫn dùng được URL cũ tới khi cleanup retention xóa; gallery luôn trỏ currentVersion.
 - Crop/rotate/flip chỉ áp dụng trên pixel; hướng hiển thị đúng vì master đã được auto-orient lúc upload.
 - `sharp.rotate(angle)` với angle chỉ định **không** auto-orient lại; `.flop()` là lật ngang, không dùng `.flip()` (lật dọc).
+- Chỉ owner mới thấy nút Edit/Restore/Delete; API vẫn kiểm tra quyền độc lập (không tin UI).
 
 ### 8.4 Browser preview trước khi gửi
 
 `EditDialog`:
 
-1. Tải variant `large` (hoặc `medium` nếu không có large) để hiển thị; biết master width/height từ PhotoDTO.
+1. Chỉ mở được khi `canEdit=true` (owner). Tải variant `large` (hoặc `medium` nếu không có large) để hiển thị; biết master width/height từ PhotoDTO.
 2. Người dùng kéo crop, bấm xoay trái/phải, lật ngang.
 3. Canvas vẽ lại đúng thứ tự crop → rotate → flipH, hiển thị kết quả preview.
 4. Hiển thị kích thước output dự kiến và cảnh báo nếu crop không hợp lệ.
-5. Nút "Áp dụng": gửi **chỉ tham số** (không gửi ảnh) lên server.
-6. Server validate độc lập, render bản chính thức, trả version mới; gallery hiển thị variant mới.
+5. Nút "Áp dụng": gửi **chỉ tham số** (không gửi ảnh) lên server kèm cookie session.
+6. Server validate độc lập + kiểm tra owner, render bản chính thức, trả version mới; gallery hiển thị variant mới.
 7. `restore` gửi `expectedVersion`, server tạo version từ master.
 8. Nếu 409: hiển thị "Ảnh vừa được chỉnh sửa ở nơi khác", reload metadata, không tự ghi đè.
+9. Nếu 403: đóng editor, thông báo không có quyền.
 
 Mapping tọa độ: variant preview cùng tỉ lệ với master, nên crop trên UI được quy đổi về pixel master và làm tròn; server từ chối nếu ra ngoài biên.
 
@@ -567,14 +698,18 @@ Mapping tọa độ: variant preview cùng tỉ lệ với master, nên crop tr�
 - Nếu ảnh chỉ có 1 variant, vẫn render `srcSet` một phần tử và `sizes` chính xác.
 - Ảnh đầu viewport `eager`/`fetchPriority="high"`; còn lại `lazy`.
 - Alt bắt buộc: lấy từ input khi upload; nếu trống sinh `"Ảnh {originalName}"`.
+- Gallery header có tab "Tất cả ảnh" / "Ảnh của tôi" và hiển thị tên owner trên card; mọi user đăng nhập xem được ảnh của nhau.
+- Nút Edit/Restore/Delete chỉ render khi `canEdit` (owner); user khác chỉ xem.
 
 ### 9.2 Media response
 
-- Media đi qua backend proxy để đảm bảo header và URL ổn định sau restart.
-- Key lấy từ DB; không cho client truyền storage key trực tiếp.
-- `Cache-Control: public, max-age=31536000, immutable` vì URL gắn version bất biến.
+- Media đi qua backend proxy để đảm bảo header, auth và URL ổn định sau restart.
+- Yêu cầu session hợp lệ; không cho client truyền storage key trực tiếp.
+- Key lấy từ DB.
+- `Cache-Control: private, max-age=31536000, immutable` vì URL gắn version bất biến và ảnh yêu cầu đăng nhập.
+- `Vary: Cookie` để cache không dùng nhầm response giữa các user.
 - Object storage cũng được set `ContentType` và `CacheControl` khi upload.
-- Ảnh đã xóa/không tồn tại → `404`; lỗi storage → `502` có log.
+- Ảnh đã xóa/không tồn tại → `404`; chưa đăng nhập → `401`; lỗi storage → `502` có log.
 
 ---
 
@@ -582,11 +717,12 @@ Mapping tọa độ: variant preview cùng tỉ lệ với master, nên crop tr�
 
 ### 10.1 Xóa
 
-1. Transaction: `status = DELETED`, `deletedAt = now`; gallery API loại ngay.
-2. Gọi `listPrefix("photos/{id}/")` + `deleteMany`, gồm master, mọi version, variant.
-3. Nếu xóa object thành công: hard-delete `Photo` (cascade variant/version), ghi audit log.
-4. Nếu lỗi: giữ record, tạo `CleanupJob(type=DELETED_PHOTO, runAfter=now)`, trả `202`.
-5. Worker retry với backoff; media route luôn 404 cho photo DELETED.
+1. `requireAuth` + kiểm tra owner; user khác → `403`.
+2. Transaction: `status = DELETED`, `deletedAt = now`; gallery API loại ngay.
+3. Gọi `listPrefix("photos/{id}/")` + `deleteMany`, gồm master, mọi version, variant.
+4. Nếu xóa object thành công: hard-delete `Photo` (cascade variant/version), ghi audit log.
+5. Nếu lỗi: giữ record, tạo `CleanupJob(type=DELETED_PHOTO, runAfter=now)`, trả `202`.
+6. Worker retry với backoff; media route luôn 404 cho photo DELETED.
 
 ### 10.2 Các nhóm retention (đồng bộ với README)
 
@@ -597,9 +733,11 @@ Mapping tọa độ: variant preview cùng tỉ lệ với master, nên crop tr�
 | `deleted_photo` | Photo DELETED | Chạy ngay, retry tối đa 24 giờ | Xóa toàn bộ prefix, hard-delete DB |
 | `orphan_object` | Object dưới `photos/` không có trong DB | 24 giờ kể từ LastModified | Xóa object |
 | `journal_keys` | Key trong cleanup journal do lỗi DB | 24 giờ | Xóa file, xóa dòng journal |
+| `expired_session` | Session hết hạn (DB) | 0 | Xóa bản ghi session, không liên quan file |
 
 - `server/src/config/retention.ts` là nguồn cấu hình; README ghi bảng giá trị mặc định + env override.
 - Worker chạy khi server start và theo interval (mặc định 15 phút).
+- Session hết hạn cũng được xóa định kỳ mỗi giờ.
 - Có CLI chạy tay để nghiệm thu:
 
 ```bash
@@ -632,14 +770,25 @@ npm run cleanup -- --all
 # server
 PORT=3000
 PUBLIC_BASE_URL=http://localhost:3000
-DATABASE_URL=file:../.data/dev.db
+DATABASE_URL=postgresql://gallery:gallery@localhost:5432/photo_gallery?schema=public
 
-# storage (MinIO mặc định; SeaweedFS dùng cùng S3 API)
-S3_ENDPOINT=http://localhost:9000
+# auth
+SESSION_SECRET=thay-bang-chuoi-ngau-nhien-it-nhat-32-ky-tu
+SESSION_TTL_DAYS=7
+COOKIE_SECURE=false          # true khi chạy HTTPS/production
+AUTH_RATE_LIMIT_PER_MIN=10
+
+# postgres (dùng cho docker-compose)
+POSTGRES_USER=gallery
+POSTGRES_PASSWORD=gallery
+POSTGRES_DB=photo_gallery
+
+# storage — SeaweedFS S3 gateway
+S3_ENDPOINT=http://localhost:8333
 S3_REGION=us-east-1
 S3_BUCKET=photo-gallery
-S3_ACCESS_KEY=minioadmin
-S3_SECRET_KEY=minioadmin
+S3_ACCESS_KEY=gallery
+S3_SECRET_KEY=thay-bang-secret-seaweedfs
 S3_FORCE_PATH_STYLE=true
 
 # upload / ảnh
@@ -662,9 +811,67 @@ CLEANUP_INTERVAL_MINUTES=15
 
 Compose:
 
-- `docker compose up -d minio` + tạo bucket bằng lệnh trong README (hoặc server tự `CreateBucket` nếu thiếu).
-- `docker compose --profile seaweedfs up -d seaweedfs` (S3 gateway; `S3_FORCE_PATH_STYLE=true`, endpoint port 8333). SeaweedFS cần tạo bucket trước bằng AWS CLI/weed shell theo README.
-- Volume bền cho cả DB lẫn storage.
+- `docker compose up -d postgres seaweedfs` — PostgreSQL 16 + SeaweedFS (master/volume/filer/S3 gateway), server tự chạy migration khi start.
+- SeaweedFS chạy một tiến trình `server -s3 -s3.config=/etc/seaweedfs/s3.json -dir=/data`, expose S3 gateway ở `localhost:8333`.
+- `infra/seaweedfs/s3.json` khai báo identity `gallery` với access/secret key khớp `S3_ACCESS_KEY`/`S3_SECRET_KEY`, quyền `Admin`, `Read`, `Write`, `List`, `Tagging`; không bật anonymous access.
+- `S3_FORCE_PATH_STYLE=true` bắt buộc với SeaweedFS. Server gọi `CreateBucket` nếu bucket chưa tồn tại (hoặc tạo tay: `aws --endpoint-url http://localhost:8333 s3 mb s3://photo-gallery`).
+- Volume bền cho PostgreSQL, SeaweedFS (`/data`) và `.data` (journal/temp). Tắt/bật lại container không mất user, photo, variant.
+- Pin image tag SeaweedFS cụ thể trong README; không dùng `latest` khi nghiệm thu.
+
+### 11.1 Mẫu SeaweedFS (S3 gateway)
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gallery}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gallery}
+      POSTGRES_DB: ${POSTGRES_DB:-photo_gallery}
+    ports: ["5432:5432"]
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:<pin-tag>
+    command: >
+      server -s3 -dir=/data
+      -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "8333:8333"   # S3 gateway
+      - "9333:9333"   # master (debug/local)
+      - "8888:8888"   # filer (debug/local)
+    volumes:
+      - "seaweed_data:/data"
+      - "./infra/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro"
+
+volumes:
+  pg_data:
+  seaweed_data:
+```
+
+```json
+// infra/seaweedfs/s3.json — local dev, secret phải khớp S3_SECRET_KEY
+{
+  "identities": [
+    {
+      "name": "gallery",
+      "credentials": [
+        { "accessKey": "gallery", "secretKey": "thay-bang-secret-seaweedfs" }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    }
+  ]
+}
+```
+
+Lưu ý vận hành:
+
+- Không thêm identity `anonymous`; mọi request S3 phải có credential.
+- Cấu hình SDK: `endpoint: http://localhost:8333`, `region: us-east-1`, `forcePathStyle: true`, credentials từ env.
+- App gọi `HeadBucket`/`CreateBucket` khi start; nếu bucket đã có thì bỏ qua.
+- Kiểm tra nhanh: upload một object, restart container `seaweedfs`, đọc lại object và chạy `listPrefix("photos/")` phải còn dữ liệu.
+- Không commit secret thật; README hướng dẫn copy từ `.env` hoặc file mẫu.
+
 
 ---
 
@@ -674,61 +881,73 @@ Compose:
 
 - [ ] npm workspaces, TypeScript strict, lint/format.
 - [ ] Express app + `/api/health`; Vite React app.
-- [ ] Docker compose MinIO (default) + SeaweedFS (profile).
-- [ ] Prisma schema + migration SQLite; `.env.example`; `.gitignore`.
+- [ ] Docker compose PostgreSQL 16 + SeaweedFS S3 gateway; volume bền; `s3.json`.
+- [ ] Prisma schema PostgreSQL đầy đủ (User, Session, Photo, Version, Variant, CleanupJob) + migration; `.env.example`; `.gitignore`.
 - [ ] Storage adapter S3: `ensureBucket`, `put`, `getStream`, `head`, `deleteMany`, `listPrefix`.
-- [ ] README khung + bảng retention.
+- [ ] README khung + bảng retention + hướng dẫn PostgreSQL và SeaweedFS local.
 
-**Done:** server và web chạy; restart vẫn giữ DB; health báo storage OK.
+**Done:** server và web chạy; Postgres lưu user/photo qua restart; health báo DB + storage OK.
 
-### M1 — Upload & variant
+### M1 — Đăng ký, đăng nhập, session
+
+- [ ] `POST /api/auth/register`, `login`, `logout`, `GET /api/auth/me`.
+- [ ] Hash argon2id; session token ngẫu nhiên + SHA-256 trong DB; cookie httpOnly/SameSite.
+- [ ] Middleware `requireAuth`; rate limit auth; validate email/password/displayName.
+- [ ] LoginPage/RegisterPage/AuthContext/ProtectedRoute; header hiển thị user + đăng xuất.
+- [ ] Test: register trùng email, login sai, cookie hết hạn, logout thu hồi session.
+
+**Done:** user đăng ký/đăng nhập được; route bảo vệ trả 401 khi chưa login; không lộ passwordHash.
+
+### M2 — Upload & variant
 
 - [ ] Busboy nhận tối đa 5 file, giới hạn byte từng file, không hủy file khác.
 - [ ] Magic bytes + sharp decode + pixel/side validation; strip EXIF.
 - [ ] Normalize master; sinh tối đa 3 variant; key naming; checksum.
-- [ ] Transaction Photo + v1 + variants; per-file result; DB failure cleanup + journal.
+- [ ] Transaction Photo(ownerId) + v1 + variants; per-file result; DB failure cleanup + journal.
 - [ ] Test JPEG/PNG hợp lệ, file giả, quá byte, quá pixel, hỗn hợp.
 
 **Done:** upload 1–5 ảnh trả kết quả riêng từng file; chỉ ảnh thật được lưu; DB không có record/file rác.
 
-### M2 — Gallery responsive & media
+### M3 — Gallery chung, responsive & media
 
-- [ ] `GET /api/photos` DTO + cursor.
-- [ ] Media proxy `/media/:id/v/:version/:kind` với Content-Type, Cache-Control, ETag.
-- [ ] React Gallery + PhotoCard với `srcset`, `sizes`, width/height, loading, alt.
-- [ ] Upload UI hiển thị kết quả/ lỗi từng file.
+- [ ] `GET /api/photos` DTO + cursor + `scope=all|mine`, kèm owner và `canEdit`.
+- [ ] Media proxy `/media/:id/v/:version/:kind` yêu cầu auth, Content-Type, Cache-Control private, ETag.
+- [ ] React Gallery + PhotoCard với `srcset`, `sizes`, width/height, loading, alt; hiển thị owner.
+- [ ] Upload UI hiển thị kết quả/lỗi từng file; tab Tất cả/Ảnh của tôi.
 - [ ] Test network: viewport nhỏ chọn thumb, desktop chọn medium/large; không mặc định large.
+- [ ] Test user B xem được ảnh user A nhưng không thấy nút sửa/xóa.
 
-**Done:** DOM/network/headers đạt mục 13.
+**Done:** DOM/network/headers đạt mục 13; gallery chung hoạt động đúng quyền xem.
 
-### M3 — Chỉnh sửa, version, restore
+### M4 — Chỉnh sửa, version, restore
 
 - [ ] Zod strict cho crop/rotate/flip/expectedVersion; validate biên trên master.
+- [ ] Kiểm tra owner ở service + route; user khác 403.
 - [ ] Version allocation + STAGED + publish CAS + supersede version cũ.
 - [ ] Render từ master theo thứ tự crop → rotate → flop; strip EXIF.
 - [ ] Restore tạo version identity từ master.
-- [ ] EditDialog canvas preview; gửi params; xử lý 409.
+- [ ] EditDialog canvas preview; gửi params; xử lý 409/403.
 - [ ] Test edit 2 lần liên tiếp vẫn bắt đầu từ master; EXIF/GPS absent; orientation pixel đúng.
 
-**Done:** version mới dưới `photos/p01/v2/`; gallery cập nhật; không variant nào còn GPS.
+**Done:** version mới dưới `photos/p01/v2/`; gallery cập nhật; không variant nào còn GPS; chỉ owner sửa được.
 
-### M4 — Xóa & cleanup
+### M5 — Xóa & cleanup
 
-- [ ] DELETE ẩn ngay, purge file + DB, retry job.
-- [ ] Cleanup job cho staged/superseded/deleted/orphan/journal.
+- [ ] DELETE ẩn ngay, kiểm tra owner, purge file + DB, retry job.
+- [ ] Cleanup job cho staged/superseded/deleted/orphan/journal + session hết hạn.
 - [ ] CLI cleanup + startup recovery + interval worker.
 - [ ] README retention table đồng bộ config.
 - [ ] Test: xóa → storage prefix rỗng, DB record/variant sạch; xóa file lỗi → job retry.
 
 **Done:** sau `npm run cleanup -- --photo p01`, storage không còn object, DB không còn/đánh dấu purged.
 
-### M5 — Nghiệm thu & hardening
+### M6 — Nghiệm thu & hardening
 
-- [ ] Playwright: upload, gallery attrs, responsive currentSrc, edit preview/submit, restore, delete.
-- [ ] Test restart: upload → restart server → gallery + media URL vẫn hoạt động.
+- [ ] Playwright: register/login, upload, gallery attrs, responsive currentSrc, xem chéo user, edit preview/submit, restore, delete.
+- [ ] Test restart: upload → restart server → login cũ vẫn dùng được, gallery + media URL hoạt động.
 - [ ] Test DB failure injection sau upload → file được xóa/journal ghi lại.
-- [ ] Test SeaweedFS và MinIO.
-- [ ] README đầy đủ: setup, API, retention, lệnh test, checklist.
+- [ ] Test SeaweedFS S3 gateway (bucket, path-style, multipart, delete prefix).
+- [ ] README đầy đủ: setup PostgreSQL + SeaweedFS, auth, API, retention, lệnh test, checklist.
 - [ ] Logging requestId, error code thống nhất, dọn temp file.
 
 **Done:** toàn bộ checklist mục 13 pass.
@@ -739,13 +958,19 @@ Compose:
 
 | Yêu cầu | Cách kiểm tra | Bằng chứng |
 |---|---|---|
-| Upload JPEG + PNG | Upload 1 JPEG, 1 PNG; query DB | Có `Photo`, v1 `PUBLISHED`, 1–3 `PhotoVariant` mỗi ảnh |
+| Đăng ký / đăng nhập | Register user mới → logout → login lại; query DB | User tạo mới, session cookie set, login thành công |
+| Không lưu mật khẩu plaintext | Query bảng `User` | `passwordHash` argon2id, không có mật khẩu gốc |
+| Chưa đăng nhập bị chặn | Gọi `/api/photos`, `/media/...` không cookie | `401 UNAUTHENTICATED`; web chuyển về Login |
+| Xem ảnh chéo user | User A upload; login user B; mở gallery chung | B thấy ảnh A, tải được media của A |
+| Chỉ owner được sửa/xóa | B gọi edit/delete ảnh của A | `403 FORBIDDEN`; không tạo version/file, không xóa gì |
+| Lọc gallery | `GET /api/photos?scope=mine` với B | Chỉ ảnh B upload |
+| Upload JPEG + PNG | Upload 1 JPEG, 1 PNG; query DB | Có `Photo` gắn đúng `ownerId`, v1 `PUBLISHED`, 1–3 `PhotoVariant` mỗi ảnh |
 | Trộn file hợp lệ + file giả | Upload `real.jpg` + `fake.jpg` (text) | Chỉ `real.jpg` có Photo/file; result của fake là `INVALID_IMAGE` |
 | Vượt byte / pixel | Upload file >15MB, ảnh >50MP | Không có Photo, không có object key tương ứng; result lỗi tương ứng |
 | DB lỗi sau khi ghi file | Bật fault injection ở bước insert; quan sát storage + journal | Object vừa ghi bị xóa; nếu xóa lỗi có entry journal/job |
-| Restart server | Upload → stop/start → mở gallery & URL media | Gallery render, media 200 với header đúng |
+| Restart server | Upload → stop/start → login/session cũ + mở gallery & URL media | Session còn hiệu lực, gallery render, media 200 với header đúng |
 | Gallery chọn variant phù hợp | Playwright set viewport 375/1440; đọc `img.currentSrc` | Mobile chọn 480w, desktop chọn 1024/1600 phù hợp; `src` không phải large |
-| Content-Type + Cache-Control | `curl -I /media/p01/v2/medium` | `image/webp`; `public, max-age=31536000, immutable` |
+| Content-Type + Cache-Control | `curl -I -b cookie.txt /media/p01/v2/medium` | `image/webp`; `private, max-age=31536000, immutable`; `Vary: Cookie` |
 | DOM attributes | Inspect `img` | Có `srcset`, `sizes`, `width`, `height`, `loading`, `alt` |
 | Hướng ảnh sau xử lý | Upload JPEG có EXIF orientation 6; edit rotate 90; so pixel | Ảnh hiển thị đúng chiều |
 | Không còn GPS | `exiftool` trên tất cả variant + master | Không có `GPS*`, không có EXIF block |
@@ -753,10 +978,10 @@ Compose:
 | Crop hợp lệ | Crop trong biên → 201; crop âm/vượt biên → 422 | Không tạo version/file khi invalid |
 | Xoay | Gửi 45/360/"90" → 422; 0/90/180/270 → 201 | Chỉ 4 góc hợp lệ |
 | Lật ngang | `flipH: true/false` | Ảnh lật đúng; field khác bị reject |
-| Khôi phục | Edit → restore | Version mới từ master; ảnh về trạng thái gốc |
+| Khôi phục | Owner edit → restore | Version mới từ master; ảnh về trạng thái gốc |
 | Publish an toàn | Kill server trong lúc edit; restart | `currentVersion` không đổi; staged được dọn |
 | Version prefix | Kiểm tra storage sau edit | Có `photos/p01/v2/...`; v1 còn tới hạn retention |
-| Xóa ảnh | DELETE → gallery API | Ảnh mất ngay; sau cleanup storage rỗng, DB sạch/purged |
+| Xóa ảnh | Owner DELETE → gallery API | Ảnh mất ngay; sau cleanup storage rỗng, DB sạch/purged |
 | Cleanup retention | Set grace ngắn, chạy CLI | File superseded/staged/orphan bị xóa đúng nhóm |
 | DB chỉ lưu key | Query DB | Không có `http://` hay đường dẫn tuyệt đối trong `masterKey`/`storageKey` |
 | Alt text | Upload không alt | Có alt mặc định khác rỗng; DOM có `alt` |
@@ -773,20 +998,24 @@ Compose:
 - Variant width planner: không upscale, dedupe, tối đa 3, ảnh rất nhỏ.
 - Key naming/version allocation; thứ tự transform.
 
-### Integration (Vitest + Supertest + MinIO)
+### Integration (Vitest + Supertest + PostgreSQL + SeaweedFS)
 
+- Auth: register/login/logout/me; email trùng; sai mật khẩu; session hết hạn; route bảo vệ 401.
+- Phân quyền: user B xem gallery A, nhưng edit/delete ảnh A trả 403, không tạo file/version.
 - Upload JPEG/PNG/WebP, sprite alpha; mixed batch; oversize byte; fake magic; oversize pixel; animated reject.
 - DB failure injection: mock repository throw sau upload; assert `deleteMany` được gọi; journal khi delete fail.
 - Edit flow: v2 published, currentVersion=2, v1 SUPERSEDED; restore; conflict 409; invalid params không tạo file.
 - Delete: purge objects + DB; failure → job + 202; retry thành công.
-- Media headers/body; deleted photo 404.
-- Restart: khởi tạo app lần 2 trên cùng DB/storage; đọc gallery và media thành công.
+- Media headers/body; deleted photo 404; thiếu cookie 401.
+- Restart: khởi tạo app lần 2 trên cùng PostgreSQL/SeaweedFS; login/session cũ + gallery + media thành công.
+- SeaweedFS: bucket tự tạo, path-style, list/delete prefix, object còn nguyên sau restart container.
 
 ### E2E (Playwright)
 
-- Upload 5 ảnh, quan sát per-file result.
+- Register user A, upload 5 ảnh, quan sát per-file result; logout.
+- Register/login user B, thấy ảnh của A trong tab "Tất cả ảnh", không thấy nút Edit/Delete.
 - Kiểm tra DOM attributes và `currentSrc` ở 2 viewport.
-- Mở editor, crop/xoay/lật → preview thay đổi → submit → srcset trỏ v2.
+- Login lại A, mở editor, crop/xoay/lật → preview thay đổi → submit → srcset trỏ v2.
 - Restore → v3; ảnh khớp bản gốc.
 - Delete → biến mất, API 404; chạy cleanup → storage rỗng.
 
@@ -803,12 +1032,16 @@ Compose:
 | Rủi ro | Xử lý |
 |---|---|
 | `sharp` lỗi cài trên Windows/Node version | Pin Node LTS, dùng prebuilt sharp; ghi rõ version trong README |
-| SeaweedFS S3 khác MinIO (bucket, path-style, multipart) | `forcePathStyle`, tạo bucket qua AWS CLI; test cả hai; mặc định MinIO |
-| SQLite tranh chấp khi edit đồng thời | WAL mode, transaction ngắn, CAS `currentVersion`, `nextVersion`; ghi chú chuyển Postgres khi cần |
+| SeaweedFS S3 gateway khác S3 chuẩn (bucket, path-style, region) | `forcePathStyle`, region tùy ý, tự `CreateBucket`, test list/delete/restart; cấu hình `s3.json` rõ ràng |
+| SeaweedFS mất volume khi chạy container | Named volume cho `/data`; kiểm tra object còn sau restart trước khi nghiệm thu |
+| PostgreSQL tranh chấp khi edit đồng thời | Transaction ngắn, CAS `currentVersion`, `nextVersion`; unique `(photoId, version)` |
+| Session bị đánh cắp / CSRF | Cookie httpOnly + SameSite=Lax + Secure khi HTTPS; Origin check cho mutation; token hash trong DB |
+| Brute force login | Rate limit IP + thông báo lỗi chung; argon2id cost hợp lý |
+| User B gọi API sửa ảnh A | Kiểm tra owner ở service, không chỉ ẩn UI; test 403 |
 | Ảnh lớn làm treo event loop | `limitInputPixels`, giới hạn concurrency, xử lý tuần tự trong request, timeout |
 | Preview browser lệch server | Canonical params pixel master, cùng thứ tự transform, validate server, render chính thức từ server |
 | Xóa file nhưng DB lỗi / ngược lại | Publish hai pha, journal, cleanup job, orphan scan |
-| Cache immutable sau xóa | Chấp nhận cache ngoài tầm kiểm soát; URL version mới khi edit; xóa khỏi gallery/API ngay |
+| Cache immutable sau xóa | `private` cache; URL version mới khi edit; xóa khỏi gallery/API ngay |
 | Upload stream vượt giới hạn | Busboy per-file limit + đếm byte thủ công; discard phần vượt, không ghi toàn bộ vào RAM |
 | PNG/alpha hoặc màu CMYK | Convert sRGB, giữ alpha, test fixture tương ứng |
 | Metadata nhạy cảm (GPS) | Strip toàn bộ EXIF ở master + variants; chỉ lưu metadata an toàn (kích thước, thời gian) trong DB |
@@ -817,6 +1050,9 @@ Compose:
 
 ## 16. Definition of Done
 
+- [ ] Đăng ký/đăng nhập/đăng xuất; session cookie; route ảnh yêu cầu auth.
+- [ ] Mọi user đã đăng nhập xem được ảnh của nhau; chỉ owner được sửa/xóa/restore.
+- [ ] PostgreSQL local lưu user, session, photo, version, variant; giữ nguyên qua restart.
 - [ ] Upload 1–5 ảnh/request, kết quả riêng từng file, đúng validation thật.
 - [ ] JPEG/PNG tạo Photo + tối đa 3 variant; DB chỉ lưu storage key.
 - [ ] Gallery dùng `srcset/sizes/width/height/loading/alt`, tải variant phù hợp.
@@ -825,5 +1061,6 @@ Compose:
 - [ ] Chỉ nhận crop hợp lệ, rotate 0/90/180/270, flipH boolean.
 - [ ] Variant sau xử lý đúng hướng, không còn EXIF/GPS.
 - [ ] Xóa ảnh ẩn ngay, dọn file + DB; cleanup retention/orphan/staged/journal chạy được.
-- [ ] README có bảng retention, hướng dẫn MinIO/SeaweedFS, lệnh chạy test và checklist nghiệm thu.
+- [ ] SeaweedFS S3 là storage duy nhất; không có dependency MinIO.
+- [ ] README có bảng retention, hướng dẫn PostgreSQL + SeaweedFS, lệnh chạy test và checklist nghiệm thu.
 - [ ] Test unit + integration + E2E pass; có bằng chứng cho ma trận mục 13.
